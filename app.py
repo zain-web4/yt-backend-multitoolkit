@@ -1,26 +1,17 @@
+"""
+YouTube downloader worker (Flask + yt-dlp) — Render.
+"""
+
 import os
+import re
+from flask import Flask, request, jsonify
 import yt_dlp
-from flask import Flask, request, jsonify, abort
 
 app = Flask(__name__)
 
-WORKER_TOKEN = os.environ.get("YTDLP_WORKER_TOKEN")
-PORT = int(os.environ.get("PORT", "8000"))
-
-# Resolve cookies.txt next to this script and log status at boot
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-if os.path.exists(COOKIE_FILE):
-    try:
-        with open(COOKIE_FILE, "r", encoding="utf-8", errors="ignore") as f:
-            first = f.readline().strip()
-        if "Netscape HTTP Cookie File" not in first:
-            print(f"[warn] cookies.txt found but first line is not Netscape header: {first!r}")
-        else:
-            print(f"[ok] cookies.txt loaded from {COOKIE_FILE}")
-    except Exception as e:
-        print(f"[warn] could not read cookies.txt: {e}")
-else:
-    print(f"[warn] cookies.txt NOT found at {COOKIE_FILE} — YouTube will likely block requests")
+if not os.path.exists(COOKIE_FILE):
+    print(f"[warn] cookies.txt not found at {COOKIE_FILE}")
     COOKIE_FILE = None
 
 UA = (
@@ -29,23 +20,19 @@ UA = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-
-def check_auth():
-    if not WORKER_TOKEN:
-        return
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {WORKER_TOKEN}":
-        abort(401, description="Unauthorized")
+CLIENT_FALLBACKS = [None, ["web"], ["ios"], ["web_safari"], ["mweb"], ["tv"]]
 
 
-def base_opts(extra=None):
+def base_opts(extra=None, player_clients=None):
     opts = {
         "quiet": True,
+        "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
         "http_headers": {"User-Agent": UA},
     }
+    if player_clients:
+        opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
     if COOKIE_FILE:
         opts["cookiefile"] = COOKIE_FILE
     if extra:
@@ -53,41 +40,52 @@ def base_opts(extra=None):
     return opts
 
 
-def is_bot_block(msg: str) -> bool:
+def is_bot_block(msg):
     m = msg.lower()
-    return (
-        "sign in to confirm" in m
-        or "confirm you" in m
-        or "use --cookies" in m
-        or "cookies are no longer valid" in m
-    )
+    return "sign in to confirm" in m or "--cookies" in m or "use --cookies" in m
 
 
-@app.route("/", methods=["GET"])
+def is_format_unavailable(msg):
+    return "format is not available" in msg.lower()
+
+
+@app.get("/")
 def health():
-    return jsonify({"ok": True, "cookies_loaded": bool(COOKIE_FILE)})
+    return jsonify({
+        "ok": True,
+        "cookies_loaded": COOKIE_FILE is not None,
+        "yt_dlp": yt_dlp.version.__version__,
+    })
 
 
-@app.route("/info", methods=["POST"])
+@app.post("/info")
 def info():
-    check_auth()
     data = request.get_json(silent=True) or {}
-    url = data.get("url")
+    url = (data.get("url") or "").strip()
     if not url:
-        return jsonify({"error": "Missing 'url'"}), 400
+        return jsonify({"error": "missing url"}), 400
 
-    try:
-        with yt_dlp.YoutubeDL(base_opts()) as ydl:
-            raw = ydl.extract_info(url, download=False)
-    except Exception as e:
-        msg = str(e)
-        if is_bot_block(msg):
-            return jsonify({"error": "YouTube blocked the request. cookies.txt on the server is missing, invalid, or expired. Re-export from a logged-in browser in Netscape format and redeploy."}), 401
-        return jsonify({"error": msg}), 500
+    last_err = None
+    info_obj = None
+    for clients in CLIENT_FALLBACKS:
+        try:
+            with yt_dlp.YoutubeDL(base_opts(player_clients=clients)) as ydl:
+                info_obj = ydl.extract_info(url, download=False)
+            break
+        except Exception as e:
+            msg = str(e)
+            if is_bot_block(msg):
+                return jsonify({"error": "YouTube is blocking the request. Cookies are missing or expired."}), 401
+            last_err = msg
+            if not is_format_unavailable(msg):
+                return jsonify({"error": msg}), 500
+
+    if info_obj is None:
+        return jsonify({"error": last_err or "no client could extract this video"}), 500
 
     formats = []
-    for f in raw.get("formats") or []:
-        if not f:
+    for f in info_obj.get("formats", []) or []:
+        if not f.get("format_id"):
             continue
         formats.append({
             "format_id": f.get("format_id"),
@@ -105,62 +103,69 @@ def info():
         })
 
     return jsonify({
-        "title": raw.get("title"),
-        "thumbnail": raw.get("thumbnail"),
-        "duration": raw.get("duration"),
-        "uploader": raw.get("uploader"),
-        "channel": raw.get("channel"),
+        "title": info_obj.get("title"),
+        "thumbnail": info_obj.get("thumbnail"),
+        "duration": info_obj.get("duration"),
+        "uploader": info_obj.get("uploader"),
+        "channel": info_obj.get("channel"),
         "formats": formats,
     })
 
 
-@app.route("/download-url", methods=["POST"])
+def extract_with_selector(url, selector, player_clients=None):
+    with yt_dlp.YoutubeDL(base_opts({"format": selector}, player_clients=player_clients)) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def pick_url_and_name(info_obj):
+    url = info_obj.get("url")
+    if not url and info_obj.get("requested_formats"):
+        url = info_obj["requested_formats"][0].get("url")
+    filename = info_obj.get("title")
+    ext = info_obj.get("ext") or "mp4"
+    if filename:
+        filename = re.sub(r"[\\/:*?\"<>|]+", "_", filename) + f".{ext}"
+    return url, filename
+
+
+@app.post("/download-url")
 def download_url():
-    check_auth()
     data = request.get_json(silent=True) or {}
-    url = data.get("url")
-    fmt_id = data.get("format")
+    url = (data.get("url") or "").strip()
+    fmt = (data.get("format") or "").strip()
     has_video = bool(data.get("hasVideo", True))
     has_audio = bool(data.get("hasAudio", True))
-    if not url or not fmt_id:
-        return jsonify({"error": "Missing 'url' or 'format'"}), 400
+    if not url or not fmt:
+        return jsonify({"error": "missing url or format"}), 400
 
+    selectors = []
     if has_video and has_audio:
-        fmt = fmt_id
+        selectors += [fmt, f"{fmt}+bestaudio/best[ext=mp4]/best", "best[ext=mp4]/best"]
     elif has_video and not has_audio:
-        fmt = f"{fmt_id}+bestaudio/best[ext=mp4]/best"
-    elif has_audio and not has_video:
-        fmt = f"{fmt_id}/bestaudio/best"
+        selectors += [f"{fmt}+bestaudio/best[ext=mp4]/best", "best[ext=mp4]/best"]
     else:
-        fmt = "best[ext=mp4]/best"
+        selectors += [fmt, "bestaudio/best"]
 
-    def extract(selector):
-        with yt_dlp.YoutubeDL(base_opts({"format": selector})) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    try:
-        info_ = extract(fmt)
-    except Exception as e:
-        msg = str(e)
-        if is_bot_block(msg):
-            return jsonify({"error": "YouTube blocked the request. cookies.txt on the server is missing, invalid, or expired. Re-export from a logged-in browser in Netscape format and redeploy."}), 401
-        if "Requested format is not available" in msg:
+    last_err = None
+    for sel in selectors:
+        for clients in CLIENT_FALLBACKS:
             try:
-                info_ = extract("best[ext=mp4]/best")
-            except Exception as e2:
-                return jsonify({"error": str(e2)}), 500
-        else:
-            return jsonify({"error": msg}), 500
+                info_obj = extract_with_selector(url, sel, player_clients=clients)
+                picked, name = pick_url_and_name(info_obj)
+                if picked:
+                    return jsonify({"url": picked, "filename": name})
+                last_err = "no stream url returned"
+            except Exception as e:
+                msg = str(e)
+                if is_bot_block(msg):
+                    return jsonify({"error": "YouTube is blocking the request. Cookies are missing or expired."}), 401
+                last_err = msg
+                if not is_format_unavailable(msg):
+                    break
 
-    direct = info_.get("url")
-    if not direct and info_.get("requested_formats"):
-        direct = info_["requested_formats"][0].get("url")
-    if not direct:
-        return jsonify({"error": "No direct URL available; this format needs server-side merging."}), 422
-
-    safe = "".join(c for c in (info_.get("title") or "video") if c.isalnum() or c in " -_").strip()
-    return jsonify({"url": direct, "filename": f"{safe}.{info_.get('ext') or 'mp4'}"})
+    return jsonify({"error": last_err or "no usable format found"}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
