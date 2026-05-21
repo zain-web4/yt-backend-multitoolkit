@@ -1,26 +1,71 @@
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import yt_dlp
+from flask import Flask, request, jsonify, abort
 
 app = Flask(__name__)
-CORS(app)
 
-AUTH_TOKEN = os.environ.get("YTDLP_WORKER_TOKEN")
+WORKER_TOKEN = os.environ.get("YTDLP_WORKER_TOKEN")
+PORT = int(os.environ.get("PORT", "8000"))
+
+# Resolve cookies.txt next to this script and log status at boot
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+if os.path.exists(COOKIE_FILE):
+    try:
+        with open(COOKIE_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            first = f.readline().strip()
+        if "Netscape HTTP Cookie File" not in first:
+            print(f"[warn] cookies.txt found but first line is not Netscape header: {first!r}")
+        else:
+            print(f"[ok] cookies.txt loaded from {COOKIE_FILE}")
+    except Exception as e:
+        print(f"[warn] could not read cookies.txt: {e}")
+else:
+    print(f"[warn] cookies.txt NOT found at {COOKIE_FILE} — YouTube will likely block requests")
+    COOKIE_FILE = None
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def check_auth():
-    if not AUTH_TOKEN:
+    if not WORKER_TOKEN:
         return
-    header = request.headers.get("Authorization", "")
-    if not header.startswith("Bearer ") or header.split(" ", 1)[1] != AUTH_TOKEN:
-        from flask import abort
+    auth = request.headers.get("Authorization", "")
+    if auth != f"Bearer {WORKER_TOKEN}":
         abort(401, description="Unauthorized")
+
+
+def base_opts(extra=None):
+    opts = {
+        "quiet": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extractor_args": {"youtube": {"player_client": ["web", "android"]}},
+        "http_headers": {"User-Agent": UA},
+    }
+    if COOKIE_FILE:
+        opts["cookiefile"] = COOKIE_FILE
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def is_bot_block(msg: str) -> bool:
+    m = msg.lower()
+    return (
+        "sign in to confirm" in m
+        or "confirm you" in m
+        or "use --cookies" in m
+        or "cookies are no longer valid" in m
+    )
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "ytdlp-worker"})
+    return jsonify({"ok": True, "cookies_loaded": bool(COOKIE_FILE)})
 
 
 @app.route("/info", methods=["POST"])
@@ -31,19 +76,17 @@ def info():
     if not url:
         return jsonify({"error": "Missing 'url'"}), 400
 
-    opts = {
-        "quiet": True,
-        "skip_download": True,
-        "noplaylist": True,
-    }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with yt_dlp.YoutubeDL(base_opts()) as ydl:
+            raw = ydl.extract_info(url, download=False)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        msg = str(e)
+        if is_bot_block(msg):
+            return jsonify({"error": "YouTube blocked the request. cookies.txt on the server is missing, invalid, or expired. Re-export from a logged-in browser in Netscape format and redeploy."}), 401
+        return jsonify({"error": msg}), 500
 
     formats = []
-    for f in info.get("formats", []) or []:
+    for f in raw.get("formats") or []:
         if not f:
             continue
         formats.append({
@@ -62,11 +105,11 @@ def info():
         })
 
     return jsonify({
-        "title": info.get("title"),
-        "thumbnail": info.get("thumbnail"),
-        "duration": info.get("duration"),
-        "uploader": info.get("uploader"),
-        "channel": info.get("channel"),
+        "title": raw.get("title"),
+        "thumbnail": raw.get("thumbnail"),
+        "duration": raw.get("duration"),
+        "uploader": raw.get("uploader"),
+        "channel": raw.get("channel"),
         "formats": formats,
     })
 
@@ -82,11 +125,9 @@ def download_url():
     if not url or not fmt_id:
         return jsonify({"error": "Missing 'url' or 'format'"}), 400
 
-    # Pick a smart selector based on whether the chosen format has video/audio.
     if has_video and has_audio:
         fmt = fmt_id
     elif has_video and not has_audio:
-        # Video-only: merge with best audio, fall back to best progressive MP4.
         fmt = f"{fmt_id}+bestaudio/best[ext=mp4]/best"
     elif has_audio and not has_video:
         fmt = f"{fmt_id}/bestaudio/best"
@@ -94,47 +135,32 @@ def download_url():
         fmt = "best[ext=mp4]/best"
 
     def extract(selector):
-        opts = {
-            "quiet": True,
-            "skip_download": True,
-            "noplaylist": True,
-            "format": selector,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(base_opts({"format": selector})) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
-        info = extract(fmt)
+        info_ = extract(fmt)
     except Exception as e:
         msg = str(e)
-        # Retry once with a safe progressive fallback so the user gets *something*.
+        if is_bot_block(msg):
+            return jsonify({"error": "YouTube blocked the request. cookies.txt on the server is missing, invalid, or expired. Re-export from a logged-in browser in Netscape format and redeploy."}), 401
         if "Requested format is not available" in msg:
             try:
-                info = extract("best[ext=mp4]/best")
+                info_ = extract("best[ext=mp4]/best")
             except Exception as e2:
                 return jsonify({"error": str(e2)}), 500
         else:
             return jsonify({"error": msg}), 500
 
-    direct = info.get("url")
-    if not direct and info.get("requested_formats"):
-        # Merged stream — browser can't merge DASH, but progressive 'best'
-        # usually returns a single playable URL here.
-        direct = info["requested_formats"][0].get("url")
+    direct = info_.get("url")
+    if not direct and info_.get("requested_formats"):
+        direct = info_["requested_formats"][0].get("url")
     if not direct:
-        return jsonify({
-            "error": "No direct URL available; this format needs server-side merging."
-        }), 422
+        return jsonify({"error": "No direct URL available; this format needs server-side merging."}), 422
 
-    safe = "".join(
-        c for c in (info.get("title") or "video") if c.isalnum() or c in " -_"
-    ).strip() or "video"
-    return jsonify({
-        "url": direct,
-        "filename": f"{safe}.{info.get('ext') or 'mp4'}",
-    })
+    safe = "".join(c for c in (info_.get("title") or "video") if c.isalnum() or c in " -_").strip()
+    return jsonify({"url": direct, "filename": f"{safe}.{info_.get('ext') or 'mp4'}"})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
