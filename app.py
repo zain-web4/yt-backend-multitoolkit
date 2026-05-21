@@ -27,7 +27,7 @@ def info():
     if not url:
         return jsonify({"error": "Missing 'url'"}), 400
 
-    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True}
+    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True, "cookiefile": "cookies.txt",}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -76,7 +76,7 @@ def download_url():
     if not url or not fmt:
         return jsonify({"error": "Missing 'url' or 'format'"}), 400
 
-    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True, "format": fmt}
+    ydl_opts = {"quiet": True, "skip_download": True, "noplaylist": True, "format": fmt, "cookiefile": "cookies.txt",}
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
